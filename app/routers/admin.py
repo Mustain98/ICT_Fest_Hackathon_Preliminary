@@ -22,15 +22,21 @@ def usage_report(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    cached = cache.get_report(admin.org_id, frm, to)
-    if cached is not None:
-        return cached
-
+    # Validate first, then key the cache on the normalized dates so that
+    # "2026-1-1" and "2026-01-01" cannot occupy separate entries.
     try:
         from_date = datetime.strptime(frm, "%Y-%m-%d").date()
         to_date = datetime.strptime(to, "%Y-%m-%d").date()
     except ValueError:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid date range")
+    key_frm, key_to = from_date.isoformat(), to_date.isoformat()
+
+    cached = cache.get_report(admin.org_id, key_frm, key_to)
+    if cached is not None:
+        return cached
+
+    # Captured before the read: a write landing mid-query must discard this fill.
+    seen_version = cache.report_version(admin.org_id)
 
     range_start = datetime.combine(from_date, time.min)
     range_end = datetime.combine(to_date + timedelta(days=1), time.min)
@@ -58,7 +64,7 @@ def usage_report(
         )
 
     result = {"from": frm, "to": to, "rooms": room_rows}
-    cache.set_report(admin.org_id, frm, to, result)
+    cache.set_report(admin.org_id, key_frm, key_to, result, seen_version)
     return result
 
 

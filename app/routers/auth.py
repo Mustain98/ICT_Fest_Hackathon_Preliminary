@@ -1,5 +1,6 @@
 """Authentication endpoints: register, login, refresh, logout."""
 from fastapi import APIRouter, Depends
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import (
@@ -9,6 +10,7 @@ from ..auth import (
     get_token_payload,
     hash_password,
     revoke_access_token,
+    spend_refresh_token,
     verify_password,
 )
 from ..database import get_db
@@ -19,15 +21,32 @@ from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _get_or_create_org(db: Session, name: str) -> tuple[Organization, bool]:
+    """Return the org and whether this caller is the one that created it.
+
+    Two concurrent registrations of the same unknown org both see ``None``; the
+    loser of the unique-constraint race joins the org the winner created.
+    """
+    org = db.query(Organization).filter(Organization.name == name).first()
+    if org is not None:
+        return org, False
+
+    org = Organization(name=name)
+    db.add(org)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        org = db.query(Organization).filter(Organization.name == name).first()
+        return org, False
+    db.refresh(org)
+    return org, True
+
+
 @router.post("/register", status_code=201)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
-    org = db.query(Organization).filter(Organization.name == payload.org_name).first()
-    role = "admin" if org is None else "member"
-    if org is None:
-        org = Organization(name=payload.org_name)
-        db.add(org)
-        db.commit()
-        db.refresh(org)
+    org, created_org = _get_or_create_org(db, payload.org_name)
+    role = "admin" if created_org else "member"
 
     existing = (
         db.query(User)
@@ -35,12 +54,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         .first()
     )
     if existing is not None:
-        return {
-            "user_id": existing.id,
-            "org_id": org.id,
-            "username": existing.username,
-            "role": existing.role,
-        }
+        raise AppError(409, "USERNAME_TAKEN", "Username already taken in this organization")
 
     user = User(
         org_id=org.id,
@@ -49,7 +63,12 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         role=role,
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost the uq_user_org_username race against a concurrent registration.
+        db.rollback()
+        raise AppError(409, "USERNAME_TAKEN", "Username already taken in this organization")
     db.refresh(user)
     return {
         "user_id": user.id,
@@ -86,6 +105,9 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
+    # Refresh tokens are single-use: spend the presented one before issuing more.
+    if not spend_refresh_token(data):
+        raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
     return {
         "access_token": create_access_token(user),
         "refresh_token": create_refresh_token(user),

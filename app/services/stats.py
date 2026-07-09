@@ -1,30 +1,22 @@
 """Live per-room booking statistics.
 
-Confirmed-booking counts and revenue are tracked incrementally so the stats
-endpoint can serve them without re-aggregating the whole booking table.
+Derived from the bookings table on every read. Incremental in-memory counters
+cannot satisfy this: they lose updates under concurrent bursts and reset when
+the process restarts while the database persists.
 """
-import time
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
-_stats: dict[int, dict] = {}
-
-
-def _aggregate_pause() -> None:
-    time.sleep(0.1)
+from ..models import Booking
 
 
-def record_create(room_id: int, price_cents: int) -> None:
-    current = _stats.get(room_id, {"count": 0, "revenue": 0})
-    count, revenue = current["count"], current["revenue"]
-    _aggregate_pause()
-    _stats[room_id] = {"count": count + 1, "revenue": revenue + price_cents}
-
-
-def record_cancel(room_id: int, price_cents: int) -> None:
-    current = _stats.get(room_id, {"count": 0, "revenue": 0})
-    count, revenue = current["count"], current["revenue"]
-    _aggregate_pause()
-    _stats[room_id] = {"count": max(0, count - 1), "revenue": revenue - price_cents}
-
-
-def get(room_id: int) -> dict:
-    return _stats.get(room_id, {"count": 0, "revenue": 0})
+def get(db: Session, room_id: int) -> dict:
+    count, revenue = (
+        db.query(
+            func.count(Booking.id),
+            func.coalesce(func.sum(Booking.price_cents), 0),
+        )
+        .filter(Booking.room_id == room_id, Booking.status == "confirmed")
+        .one()
+    )
+    return {"count": count, "revenue": revenue}

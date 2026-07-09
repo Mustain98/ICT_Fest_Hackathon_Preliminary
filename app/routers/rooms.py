@@ -54,6 +54,11 @@ def create_room(
     db.add(room)
     db.commit()
     db.refresh(room)
+
+    # The usage report lists every room in the org, including ones with no
+    # bookings, so a new room changes it even before anything is booked.
+    cache.invalidate_report(admin.org_id)
+
     return _serialize_room(room)
 
 
@@ -66,14 +71,20 @@ def availability(
 ):
     room = _get_org_room(db, room_id, user.org_id)
 
-    cached = cache.get_availability(room.id, date)
-    if cached is not None:
-        return cached
-
+    # Validate first, then key the cache on the normalized date so that
+    # "2026-1-1" and "2026-01-01" cannot occupy separate entries.
     try:
         day = datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid date")
+    key_date = day.isoformat()
+
+    cached = cache.get_availability(room.id, key_date)
+    if cached is not None:
+        return cached
+
+    # Captured before the read: a write landing mid-query must discard this fill.
+    seen_version = cache.availability_version(room.id, key_date)
 
     day_start = datetime.combine(day, time.min)
     day_end = day_start + timedelta(days=1)
@@ -96,7 +107,7 @@ def availability(
             for b in bookings
         ],
     }
-    cache.set_availability(room.id, date, result)
+    cache.set_availability(room.id, key_date, result, seen_version)
     return result
 
 
@@ -107,7 +118,7 @@ def room_stats(
     user: User = Depends(get_current_user),
 ):
     room = _get_org_room(db, room_id, user.org_id)
-    current = stats.get(room.id)
+    current = stats.get(db, room.id)
     return {
         "room_id": room.id,
         "total_confirmed_bookings": current["count"],
